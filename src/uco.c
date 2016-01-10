@@ -18,29 +18,16 @@
 
 #include <stdio.h>
 #include <stdlib.h>
-#include <unistd.h>
-#include <errno.h>
-#include <sys/user.h>
-#include <sys/select.h>
-#include <sys/time.h>
 #include <string.h>
-#include <utime.h>
+#include <errno.h>
+#include <unistd.h>
+#include <sys/user.h>
 #include <sys/ptrace.h>
 #include <linux/ptrace.h>
 #include <sys/syscall.h>
-#include <linux/types.h>
-#include <sys/types.h>
 #include <sys/wait.h>
-#include <unistd.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <errno.h>
-#include <fcntl.h>
-#include <assert.h>
 #include <sys/mman.h>
-#include <linux/ipc.h>
-#include <linux/shm.h>
-#include <sys/stat.h>
+#include <jansson.h>
 
 /*
 Lots of ideas in this code are taken from
@@ -54,11 +41,16 @@ struct ChildInfo {
   int in_syscall;
   size_t child_page;
   struct user_regs_struct saved_regs;
+  int scratch_injected;
+  // Ignore sigstop because we just attached
+  int ignore_sigstop;
 };
 
 
 struct ChildInfo *cis;
 unsigned int cis_elem;
+
+FILE *outfile;
 
 
 struct ChildInfo *
@@ -66,11 +58,10 @@ ci_get(pid_t pid)
 {
   int i;
   int freepos = -1;
-  struct ChildInfo new_ci = {
-    .pid = pid,
-    .first = 1,
-    .in_syscall = 0,
-  };
+  struct ChildInfo new_ci;
+  memset(&new_ci, 0, sizeof (struct ChildInfo));
+  new_ci.first = 1;
+  new_ci.pid = pid;
   for (i = 0; i < cis_elem; i++) {
     if (cis[i].pid == pid) {
       return &cis[i];
@@ -169,32 +160,66 @@ target_strput(struct ChildInfo *ci, char *str) {
 
 
 void
+ensure_scratch(struct ChildInfo *ci, struct user_regs_struct *regs)
+{
+  switch (regs->orig_rax) {
+    case __NR_open:
+      break;
+    default:
+      return;
+  }
+  if (!ci->scratch_injected) {
+    regs->orig_rax = __NR_mmap;
+    /* addr */
+    regs->rdi = 0;
+    /* len */
+    regs->rsi = getpagesize();
+    /* prot */
+    regs->rdx = PROT_READ;
+    /* flags */
+    regs->r10 = MAP_PRIVATE | MAP_ANONYMOUS;
+    /* fd */
+    regs->r8 = -1;
+    /* offset */
+    regs->r9 = 0;
+
+    setregs(ci, regs);
+
+    ci->scratch_injected = 1;
+  }
+}
+
+
+void
+report(char *fmt, ...)
+{
+  if (!outfile) {
+    return;
+  }
+  va_list args;
+
+  va_start(args, fmt);
+  vfprintf(outfile, fmt, args);
+  //vprintf(fmt, args);
+  va_end(args);
+}
+
+
+void
 handle_syscall_enter(struct ChildInfo *ci)
 {
   struct user_regs_struct regs;
+  
   getregs(ci, &regs);
-  if (0 == ci->child_page) {
-    regs.orig_rax = __NR_mmap;
-    /* addr */
-    regs.rdi = 0;
-    /* len */
-    regs.rsi = getpagesize();
-    /* prot */
-    regs.rdx = PROT_READ;
-    /* flags */
-    regs.r10 = MAP_PRIVATE | MAP_ANONYMOUS;
-    /* fd */
-    regs.r8 = -1;
-    /* offset */
-    regs.r9 = 0;
-    return;
-  }
+  //printf("!! syscall %llu\n", (long long) regs.orig_rax);
+
+  ensure_scratch(ci, &regs);
 
   switch (regs.orig_rax) {
     case __NR_open:
     {
       char *name = target_strdup(ci, regs.rdi);
-      printf("!! open %s\n", name);
+      report("opening '%s'\n", name);
       if (0 == strcmp(name, "foo")) {
         target_strput(ci, "bar");
         regs.rdi = ci->child_page;
@@ -202,25 +227,33 @@ handle_syscall_enter(struct ChildInfo *ci)
       }
       free(name);
     }
+    case __NR_execve:
+    {
+      char *name = target_strdup(ci, regs.rdi);
+      report("execve '%s'\n", name);
+      free(name);
+    }
+    break;
     default:
       break;
   }
 
 }
 
+
 void
 handle_syscall_leave(struct ChildInfo *ci)
 {
-  if (0 == ci->child_page) {
+  if (ci->scratch_injected && 0 == ci->child_page) {
     struct user_regs_struct regs;
     getregs(ci, &regs);
     memcpy(&ci->saved_regs, &regs, sizeof (struct user_regs_struct));
     // TODO: is this correct?
     if (0 == regs.rax) {
       fprintf(stderr, "child mmap failed\n");
+      abort();
     }
     ci->child_page = regs.rax;
-    printf("got child page: %x\n", ci->child_page);
     memcpy(&regs, &ci->saved_regs, sizeof (struct user_regs_struct));
     /* re-execute syscall */
     regs.rip -= 2;
@@ -232,6 +265,40 @@ handle_syscall_leave(struct ChildInfo *ci)
 
 int
 main(int argc, char **argv) {
+  if (argc < 2) {
+    fprintf(stderr, "usage: %s CONFIG [TARGET ARGS...]\n", argv[0]);
+    return -1;
+  }
+
+  json_error_t err;
+  json_t *config = json_load_file(argv[1], 0, &err);
+
+  if (!config) {
+    fprintf(stderr, "bad config\n");
+    return 1;
+  }
+
+  if (!json_is_object(config)) {
+    fprintf(stderr, "bad config\n");
+    return 2;
+  }
+
+  {
+    json_t *j_outfile;
+    j_outfile = json_object_get(config, "outfile");
+    if (j_outfile) {
+      if (!json_is_string (j_outfile)) {
+        fprintf(stderr, "bad config (outfile must be a string)\n");
+        return 2;
+      }
+      outfile = fopen(json_string_value(j_outfile), "w");
+      if (!outfile) {
+        fprintf(stderr, "could not open outfile");
+        return 3;
+      }
+    }
+  }
+
   pid_t pid = fork();
 
   if (-1 == pid) {
@@ -245,15 +312,14 @@ main(int argc, char **argv) {
       fprintf(stderr, "PTRACE_TRACEME failed\n");
       return 1;
     }
-    int reti = execvp(argv[1], &argv[1]);
+    kill(getpid(), SIGSTOP);
+    int reti = execvp(argv[2], &argv[2]);
     if (-1 == reti) {
       fprintf(stderr, "execvp failed\n");
       return 1;
     }
     abort();
   }
-
-  printf("Child %u forked\n", (unsigned int) pid);
 
   while (1) {
     pid_t wpid;
@@ -264,8 +330,8 @@ main(int argc, char **argv) {
     if (-1 == wpid) {
       switch (errno) {
         case ECHILD:
-          printf("All children terminated\n");
-          return 0;
+          report("All children terminated\n");
+          goto cleanup;
           break;
         default:
           perror(NULL);
@@ -278,21 +344,35 @@ main(int argc, char **argv) {
     if (ci->first) {
       if (0 != ptrace(PTRACE_SETOPTIONS, wpid, 0,
                       (PTRACE_O_TRACESYSGOOD |
+                       PTRACE_O_EXITKILL |
                        PTRACE_O_TRACEFORK |
                        PTRACE_O_TRACECLONE |
                        PTRACE_O_TRACEEXEC))) {
         printf("ptrace SETOPTIONS failed\n");
         return 1;
       }
+      report("tracing new process %lu\n", (long) ci->pid);
       ci->first = 0;
+      ci->ignore_sigstop = 1;
     }
 
     if (WIFEXITED(status)) {
-      printf("Child %u exited with status %u\n", wpid, WEXITSTATUS(status));
+      report("Child %u exited with status %u\n", wpid, WEXITSTATUS(status));
     }
     if (WIFSTOPPED(status)) {
       int signum = WSTOPSIG(status);
-      if (signum == (SIGTRAP | 0x80)) {
+      siginfo_t siginfo;
+      ptrace(PTRACE_GETSIGINFO, wpid, 0, &siginfo);
+      if ((status>>16) == PTRACE_EVENT_FORK) {
+        report("event fork\n");
+        signum = 0;
+      } else if ((status>>16) == PTRACE_EVENT_CLONE) {
+        report("event clone\n");
+        signum = 0;
+      } else if ((status>>16) == PTRACE_EVENT_EXEC) {
+        report("event exec\n");
+        signum = 0;
+      } else if (signum == (SIGTRAP | 0x80)) {
         if (ci->in_syscall) {
           ci->in_syscall = 0;
           handle_syscall_leave(ci);
@@ -300,9 +380,21 @@ main(int argc, char **argv) {
           ci->in_syscall = 1;
           handle_syscall_enter(ci);
         }
+        signum = 0;
+      } else if (signum == SIGSTOP) {
+        if (ci->ignore_sigstop) {
+          signum = 0;
+          ci->ignore_sigstop = 0;
+        }
       }
-      ptrace(PTRACE_SYSCALL, wpid, 0, 0);
+      ptrace(PTRACE_SYSCALL, wpid, 0, (void *) (size_t) signum);
     }
+  }
+
+cleanup:
+
+  if (outfile) {
+    fclose(outfile);
   }
 }
 
